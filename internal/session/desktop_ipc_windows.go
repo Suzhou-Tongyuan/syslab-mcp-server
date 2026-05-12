@@ -1,0 +1,182 @@
+//go:build windows
+
+package session
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+const (
+	pipeAccessDuplex = 0x00000003
+	pipeTypeMessage  = 0x00000004
+	pipeReadMessage  = 0x00000002
+	pipeWait         = 0x00000000
+	errorMoreData    = 234
+	errorConnected   = 535
+)
+
+var (
+	kernel32              = syscall.NewLazyDLL("kernel32.dll")
+	procCreateNamedPipeW  = kernel32.NewProc("CreateNamedPipeW")
+	procConnectNamedPipe  = kernel32.NewProc("ConnectNamedPipe")
+	procDisconnectPipe    = kernel32.NewProc("DisconnectNamedPipe")
+	procPeekNamedPipe     = kernel32.NewProc("PeekNamedPipe")
+	procCloseHandle       = kernel32.NewProc("CloseHandle")
+)
+
+type windowsDesktopAcceptor struct {
+	name   string
+	handle syscall.Handle
+}
+
+type windowsPipeConn struct {
+	handle       syscall.Handle
+	readDeadline time.Time
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+func newDesktopAcceptor() (desktopAcceptor, error) {
+	name := fmt.Sprintf(`\\.\pipe\SyslabTestAPI-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	ptr, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return nil, err
+	}
+	r1, _, e1 := procCreateNamedPipeW.Call(
+		uintptr(unsafe.Pointer(ptr)),
+		uintptr(pipeAccessDuplex),
+		uintptr(pipeTypeMessage|pipeReadMessage|pipeWait),
+		1,
+		65536,
+		65536,
+		0,
+		0,
+	)
+	if r1 == uintptr(syscall.InvalidHandle) {
+		if e1 != syscall.Errno(0) {
+			return nil, e1
+		}
+		return nil, fmt.Errorf("create named pipe failed")
+	}
+	return &windowsDesktopAcceptor{name: name, handle: syscall.Handle(r1)}, nil
+}
+
+func (a *windowsDesktopAcceptor) Endpoint() string { return a.name }
+
+func (a *windowsDesktopAcceptor) Accept(ctx context.Context) (desktopDeadlineConn, error) {
+	ch := make(chan error, 1)
+	go func() {
+		r1, _, e1 := procConnectNamedPipe.Call(uintptr(a.handle), 0)
+		if r1 != 0 {
+			ch <- nil
+			return
+		}
+		if e1 == syscall.Errno(errorConnected) {
+			ch <- nil
+			return
+		}
+		if e1 != syscall.Errno(0) {
+			ch <- e1
+			return
+		}
+		ch <- fmt.Errorf("connect named pipe failed")
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = a.Close()
+		return nil, ctx.Err()
+	case err := <-ch:
+		if err != nil {
+			_ = a.Close()
+			return nil, err
+		}
+		handle := a.handle
+		a.handle = 0
+		return &windowsPipeConn{handle: handle}, nil
+	}
+}
+
+func (a *windowsDesktopAcceptor) Close() error {
+	if a.handle != 0 {
+		_, _, _ = procDisconnectPipe.Call(uintptr(a.handle))
+		_, _, _ = procCloseHandle.Call(uintptr(a.handle))
+		a.handle = 0
+	}
+	return nil
+}
+
+func (c *windowsPipeConn) Read(p []byte) (int, error) {
+	deadline := c.readDeadline
+	if deadline.IsZero() {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	for {
+		if time.Now().After(deadline) {
+			return 0, timeoutError{}
+		}
+		avail, err := c.peekAvailable()
+		if err != nil {
+			return 0, err
+		}
+		if avail > 0 {
+			var done uint32
+			err = syscall.ReadFile(c.handle, p, &done, nil)
+			if err == syscall.Errno(errorMoreData) || err == nil {
+				return int(done), nil
+			}
+			return int(done), err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (c *windowsPipeConn) Write(p []byte) (int, error) {
+	var done uint32
+	if err := syscall.WriteFile(c.handle, p, &done, nil); err != nil {
+		return int(done), err
+	}
+	return int(done), nil
+}
+
+func (c *windowsPipeConn) Close() error {
+	if c.handle != 0 {
+		_, _, _ = procDisconnectPipe.Call(uintptr(c.handle))
+		_, _, _ = procCloseHandle.Call(uintptr(c.handle))
+		c.handle = 0
+	}
+	return nil
+}
+
+func (c *windowsPipeConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+
+func (c *windowsPipeConn) peekAvailable() (uint32, error) {
+	var avail uint32
+	r1, _, e1 := procPeekNamedPipe.Call(
+		uintptr(c.handle),
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&avail)),
+		0,
+	)
+	if r1 == 0 {
+		if e1 != syscall.Errno(0) {
+			return 0, e1
+		}
+		return 0, fmt.Errorf("peek named pipe failed")
+	}
+	return avail, nil
+}
