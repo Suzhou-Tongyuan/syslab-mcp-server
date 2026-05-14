@@ -7,9 +7,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"syslab-mcp/internal/config"
+	"syslab-mcp/internal/session"
 	"syslab-mcp/internal/testutil"
 	"syslab-mcp/internal/tydocs"
 )
@@ -34,10 +37,65 @@ func TestRequiredString(t *testing.T) {
 	}
 }
 
+func TestOptionalBool(t *testing.T) {
+	value, err := optionalBool(map[string]any{"include_all_packages": true}, "include_all_packages")
+	if err != nil {
+		t.Fatalf("optionalBool() error = %v", err)
+	}
+	if !value {
+		t.Fatal("expected true")
+	}
+}
+
+func TestOptionalBoolRejectsNonBoolean(t *testing.T) {
+	_, err := optionalBool(map[string]any{"include_all_packages": "true"}, "include_all_packages")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestCatalogCallUnknownTool(t *testing.T) {
 	c := &Catalog{tools: map[string]Tool{}}
 	if _, err := c.Call(context.Background(), "missing_tool", map[string]any{}); err == nil {
 		t.Fatal("expected error for unknown tool")
+	}
+}
+
+func TestDetectSyslabToolboxesSchema(t *testing.T) {
+	c := NewCatalog(nil, nil, "", false)
+	tool, ok := c.tools["detect_syslab_toolboxes"]
+	if !ok {
+		t.Fatal("missing detect_syslab_toolboxes tool")
+	}
+	properties, ok := tool.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected properties type: %T", tool.InputSchema["properties"])
+	}
+	field, ok := properties["include_all_packages"].(map[string]any)
+	if !ok {
+		t.Fatal("expected include_all_packages property")
+	}
+	if field["type"] != "boolean" {
+		t.Fatalf("unexpected include_all_packages type: %v", field["type"])
+	}
+}
+
+func TestRestartJuliaSchema(t *testing.T) {
+	c := NewCatalog(nil, nil, "", false)
+	tool, ok := c.tools["restart_julia"]
+	if !ok {
+		t.Fatal("missing restart_julia tool")
+	}
+	properties, ok := tool.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected properties type: %T", tool.InputSchema["properties"])
+	}
+	field, ok := properties["working_directory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected working_directory property")
+	}
+	if field["type"] != "string" {
+		t.Fatalf("unexpected working_directory type: %v", field["type"])
 	}
 }
 
@@ -159,6 +217,25 @@ func TestReadSyslabSkillWithExplicitPath(t *testing.T) {
 	}
 }
 
+func TestReadSyslabSkillWithDefaultSentinel(t *testing.T) {
+	root := testutil.TestDir(t)
+	skillPath := filepath.Join(root, "SKILL.md")
+	if err := os.WriteFile(skillPath, []byte("# Sample Skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCatalog(nil, nil, skillPath, false)
+	out, err := c.Call(context.Background(), "read_syslab_skill", map[string]any{
+		"skill_path": "default",
+	})
+	if err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+	if !strings.Contains(out, `"tool": "read_syslab_skill"`) {
+		t.Fatalf("unexpected output: %s", out)
+	}
+}
+
 func TestResolveMatlabSymbols(t *testing.T) {
 	root := testutil.TestDir(t)
 	home := filepath.Join(root, "home")
@@ -230,6 +307,62 @@ func TestParseDetectEnvironmentOutput(t *testing.T) {
 	}
 	if metadata["bindir"] != "C:\\julia\\bin" {
 		t.Fatalf("unexpected bindir: %q", metadata["bindir"])
+	}
+}
+
+func TestDetectSyslabToolboxesResolvesRuntimeConfigBeforeDiscovery(t *testing.T) {
+	root := testutil.TestDir(t)
+	juliaRoot := filepath.Join(root, "julia-1.10.10")
+	launcherName := "julia-ty.sh"
+	launcherBody := "#!/bin/sh\n"
+	if runtime.GOOS == "windows" {
+		launcherName = "julia-ty.bat"
+		launcherBody = "@echo off\r\n"
+	}
+	launcherPath := filepath.Join(juliaRoot, "bin", launcherName)
+	if err := os.MkdirAll(filepath.Dir(launcherPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launcherPath, []byte(launcherBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	syslabEnvDir := filepath.Join(root, ".syslab")
+	if err := os.MkdirAll(syslabEnvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(syslabEnvDir, "syslab-env.ini"), []byte("[Syslab]\nJULIA_HOME="+filepath.ToSlash(juliaRoot)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	versionDir := filepath.Join(root, "versionInfo")
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(versionDir, "build_info.json"), []byte(`{"version":"2026a"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	oldUserProfile := os.Getenv("USERPROFILE")
+	if err := os.Setenv("HOME", root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("USERPROFILE", root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv("HOME", oldHome)
+		_ = os.Setenv("USERPROFILE", oldUserProfile)
+	})
+
+	sess := session.NewManager(config.Config{SyslabRoot: root}, log.New(io.Discard, "", 0))
+	_, err := detectSyslabToolboxes(context.Background(), sess, tydocs.NewCatalog(root, "", "", log.New(io.Discard, "", 0)), false)
+	if err == nil || !strings.Contains(err.Error(), "JULIA_DEPOT_PATH") {
+		t.Fatalf("expected downstream depot-path error after runtime config resolution, got %v", err)
+	}
+	if got := sess.LauncherPath(); got != launcherPath {
+		t.Fatalf("expected resolved launcher path %q, got %q", launcherPath, got)
 	}
 }
 

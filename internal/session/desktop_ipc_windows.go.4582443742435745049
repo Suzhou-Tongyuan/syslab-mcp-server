@@ -24,13 +24,13 @@ const (
 )
 
 var (
-	kernel32             = syscall.NewLazyDLL("kernel32.dll")
-	procCreateFileW      = kernel32.NewProc("CreateFileW")
-	procCreateNamedPipeW = kernel32.NewProc("CreateNamedPipeW")
-	procConnectNamedPipe = kernel32.NewProc("ConnectNamedPipe")
-	procDisconnectPipe   = kernel32.NewProc("DisconnectNamedPipe")
-	procPeekNamedPipe    = kernel32.NewProc("PeekNamedPipe")
-	procCloseHandle      = kernel32.NewProc("CloseHandle")
+	kernel32              = syscall.NewLazyDLL("kernel32.dll")
+	procCreateFileW       = kernel32.NewProc("CreateFileW")
+	procCreateNamedPipeW  = kernel32.NewProc("CreateNamedPipeW")
+	procConnectNamedPipe  = kernel32.NewProc("ConnectNamedPipe")
+	procDisconnectPipe    = kernel32.NewProc("DisconnectNamedPipe")
+	procPeekNamedPipe     = kernel32.NewProc("PeekNamedPipe")
+	procCloseHandle       = kernel32.NewProc("CloseHandle")
 )
 
 type windowsDesktopAcceptor struct {

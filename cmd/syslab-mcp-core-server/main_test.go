@@ -12,24 +12,21 @@ func TestNormalizeSyslabDisplayMode(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                string
-		mode                string
-		hasDefaultSyslabEnv bool
-		want                string
+		name string
+		mode string
+		want string
 	}{
-		{name: "empty defaults to desktop", mode: "", hasDefaultSyslabEnv: true, want: "desktop"},
-		{name: "desktop preserved when env exists", mode: "desktop", hasDefaultSyslabEnv: true, want: "desktop"},
-		{name: "empty falls back when env missing", mode: "", hasDefaultSyslabEnv: false, want: "nodesktop"},
-		{name: "desktop falls back when env missing", mode: "desktop", hasDefaultSyslabEnv: false, want: "nodesktop"},
-		{name: "nodesktop preserved when env missing", mode: "nodesktop", hasDefaultSyslabEnv: false, want: "nodesktop"},
+		{name: "empty defaults to desktop", mode: "", want: "desktop"},
+		{name: "desktop preserved", mode: "desktop", want: "desktop"},
+		{name: "nodesktop preserved", mode: "nodesktop", want: "nodesktop"},
 	}
 
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := normalizeSyslabDisplayMode(tt.mode, tt.hasDefaultSyslabEnv); got != tt.want {
-				t.Fatalf("normalizeSyslabDisplayMode(%q, %v) = %q, want %q", tt.mode, tt.hasDefaultSyslabEnv, got, tt.want)
+			if got := normalizeSyslabDisplayMode(tt.mode); got != tt.want {
+				t.Fatalf("normalizeSyslabDisplayMode(%q) = %q, want %q", tt.mode, got, tt.want)
 			}
 		})
 	}

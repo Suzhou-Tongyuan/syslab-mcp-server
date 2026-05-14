@@ -1,7 +1,6 @@
-# Syslab MCP Server
----
-&nbsp;
-`syslab-mcp-server`是一个面向本地 Syslab Julia 环境的 stdio MCP 服务，支持 Windows 和 Linux。
+﻿# Syslab MCP Server
+
+`Syslab MCP Server` 是一个面向本地 Syslab Julia 环境的 `stdio` MCP 服务，支持 Windows 和 Linux。
 
 它提供的能力包括：
 
@@ -9,7 +8,6 @@
 - 执行 Julia 代码
 - 执行本地 Julia 脚本
 - 重启 Julia 会话
-- 列出当前所有活跃会话及其状态
 - 搜索本机 Syslab 帮助文档
 - 读取本机帮助文档正文
 - 查询与 MATLAB 函数等价的 Syslab Julia 函数
@@ -128,47 +126,73 @@ claude mcp add --scope user syslab -- "C:\Program Files\MWORKS\Syslab 2026a\Tool
 | `pkg-offline` | 是否以离线包模式启动 Julia。默认值：`true`。 | `--pkg-offline=true` |
 | `syslab-display-mode` | 是否启动 Syslab 桌面。`nodesktop` 不启动 Syslab 桌面；`desktop` 启动 Syslab 桌面。默认值：`desktop`。 | `--syslab-display-mode=desktop` |
 
+## 超时配置
+
+不同 Agent 对 MCP 工具调用有默认超时限制。如果遇到工具执行超时问题，可以按需调整超时时间。
+
+### OpenCode
+
+在 `~/.config/opencode/opencode.json` 中为 `syslab` MCP 配置添加 `timeout` 字段：
+
+```json
+{
+  "mcp": {
+    "syslab": {
+      "type": "...",
+      "command": ["..."],
+      "timeout": 300000
+    }
+  }
+}
+```
+
+单位为毫秒，`300000` 表示 5 分钟。
+
+### Codex
+
+在 `~/.codex/config.toml` 中为 `syslab` MCP 配置添加 `tool_timeout_sec` 字段：
+
+```toml
+[mcp_servers.syslab]
+command = "..."
+args = ["..."]
+tool_timeout_sec = 300
+```
+
+单位为秒，`300` 表示 5 分钟。
+
 ## MCP Tools
 
 1. `detect_syslab_toolboxes`
    - 返回本机 Syslab 版本信息、Julia 环境信息、Syslab Julia 环境中已安装的 Julia 包，以及可发现的本地包文档路径。
-   - 输入参数：无。
-
+   - 输入参数：
+   - `include_all_packages`（boolean，可选）：是否返回当前 Julia 全局环境中的所有已安装包。默认 `false`。不填或为 `false` 时，仅返回包名以 `Ty` 开头的包。
 1. `evaluate_julia_code`
    - 执行一段 Julia 代码并返回输出与最终结果。
    - 输入参数：
    - `code`（string）：要执行的 Julia 代码。
-
 1. `run_julia_file`
    - 执行本地 Julia 脚本并返回输出。脚本路径必须指向有效的 `.jl` 文件。
    - 输入参数：
    - `script_path`（string）：Julia 脚本绝对路径。示例：`C:\Users\name\project\demo.jl` 或 `/home/user/project/demo.jl`。
-
 1. `restart_julia`
    - 重启全局 Julia 会话。
-   - 输入参数：无。
-
-1. `list_sessions`
-   - 列出当前所有活跃会话及其状态。
-   - 输入参数：无。
-
+   - 输入参数：
+   - `working_directory`（string，可选）：重启后使用的工作目录。省略时使用默认工作目录。
 1. `read_syslab_skill`
    - 读取 Syslab skill markdown 文件内容。
    - 输入参数：
-   - `skill_path`（string，可选）：skill markdown 文件绝对路径。不传时默认读取 Syslab 的 skill。
-
+   - `skill_path`（string，必填）：传 `default` 时读取默认 skill；传绝对路径时读取指定 skill。
 1. `search_syslab_docs`
    - 搜索本地已索引的 Syslab 帮助文档。
    - 输入参数：
    - `query`（string）：搜索关键词。
    - `package`（string，可选）：限定搜索的包名。
    - `max_results`（number，可选）：返回结果条数上限。
-
 1. `read_syslab_doc`
    - 读取一篇已索引的 Syslab 帮助文档的正文内容。
    - 输入参数：
    - `doc_path`（string）：文档路径，通常直接使用 `search_syslab_docs` 返回结果中的 `path` 字段。
-
 1. `map_matlab_functions_to_julia`
    - 将一组 MATLAB 函数名映射到 Syslab Julia 环境中的候选等价函数及相关文档，适用于 MATLAB 代码迁移和函数替换场景。
    - 输入参数：

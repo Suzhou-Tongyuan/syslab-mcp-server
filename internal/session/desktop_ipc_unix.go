@@ -64,3 +64,17 @@ func (a *unixDesktopAcceptor) Close() error {
 	}
 	return nil
 }
+
+func connectDesktopEndpoint(ctx context.Context, endpoint string) (desktopDeadlineConn, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", endpoint)
+	if err != nil {
+		return nil, err
+	}
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("unexpected unix connection type %T", conn)
+	}
+	return unixConn, nil
+}

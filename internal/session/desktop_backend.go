@@ -14,11 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"syslab-mcp/internal/config"
+	"syslab-mcp/internal/syslabenv"
 	"time"
 )
 
 const (
 	desktopPipeEnvVar          = "SYSLAB_TEST_API_PIPE_NAME"
+	desktopAttachPipeEnvVar    = "SYSLAB_API_PIPE"
 	desktopReadyCommand        = "syslab.hasStarted"
 	desktopStartREPLCommand    = "language-julia.startREPL"
 	desktopStopREPLCommand     = "language-julia.stopREPL"
@@ -68,17 +70,43 @@ type desktopEnvStatus struct {
 	XDGSessionType     string
 }
 
-func (m *Manager) ensureDesktopStartedLocked(ctx context.Context, key string) (*bridgeSession, error) {
-	if sess, ok := m.sessions[key]; ok && sess.Desktop != nil && sess.Cmd != nil {
+func (m *Manager) ensureDesktopStartedLocked(ctx context.Context, key string, workingDirOverride string) (*bridgeSession, error) {
+	if sess, ok := m.sessions[key]; ok && sess.Desktop != nil {
 		return sess, nil
 	}
 
-	wd := m.workingDirForKey(key)
-	ds, err := startDesktopSession(ctx, m.cfg, wd, m.logger)
+	wd := m.workingDirForKey(key, workingDirOverride)
+
+	if endpoint := strings.TrimSpace(os.Getenv(desktopAttachPipeEnvVar)); endpoint != "" {
+		ds, err := attachDesktopSession(ctx, m.cfg, wd, endpoint, m.logger)
+		if err == nil {
+			return m.storeDesktopSessionLocked(key, wd, ds), nil
+		}
+		if m.logger != nil {
+			m.logger.Printf("attach to existing Syslab desktop via %s failed, falling back to local startup checks: %v", desktopAttachPipeEnvVar, err)
+		}
+	}
+
+	hasDefaultSyslabEnv, err := syslabenv.DefaultExists()
 	if err != nil {
 		return nil, err
 	}
+	if !hasDefaultSyslabEnv {
+		if m.logger != nil {
+			m.logger.Printf("default syslab-env.ini not found and %s is unavailable; falling back to nodesktop mode", desktopAttachPipeEnvVar)
+		}
+		m.cfg.SyslabDisplayMode = "nodesktop"
+		return m.ensureStartedLocked(ctx, key, workingDirOverride)
+	}
 
+	ds, err := launchDesktopSession(ctx, m.cfg, wd, m.logger)
+	if err != nil {
+		return nil, err
+	}
+	return m.storeDesktopSessionLocked(key, wd, ds), nil
+}
+
+func (m *Manager) storeDesktopSessionLocked(key, wd string, ds *desktopSession) *bridgeSession {
 	sess := &bridgeSession{
 		Key:        key,
 		WorkingDir: wd,
@@ -87,11 +115,11 @@ func (m *Manager) ensureDesktopStartedLocked(ctx context.Context, key string) (*
 		Desktop:    ds,
 	}
 	m.sessions[key] = sess
-	return sess, nil
+	return sess
 }
 
 func (m *Manager) callDesktopLocked(ctx context.Context, key, method, cwd, payload string) (BridgeResult, error) {
-	sess, err := m.ensureDesktopStartedLocked(ctx, key)
+	sess, err := m.ensureDesktopStartedLocked(ctx, key, "")
 	if err != nil {
 		return BridgeResult{}, err
 	}
@@ -103,17 +131,24 @@ func (m *Manager) callDesktopLocked(ctx context.Context, key, method, cwd, paylo
 		m.logger.Printf("desktop call failed, resetting session and retrying once: %v", err)
 	}
 	m.resetLocked(key)
-	sess, restartErr := m.ensureDesktopStartedLocked(ctx, key)
+	sess, restartErr := m.ensureDesktopStartedLocked(ctx, key, "")
 	if restartErr != nil {
 		return BridgeResult{}, restartErr
 	}
 	return m.callDesktopWithSession(ctx, sess, method, cwd, payload)
 }
 
-func (m *Manager) restartDesktopLocked(ctx context.Context, key string) (SessionInfo, error) {
-	sess, err := m.ensureDesktopStartedLocked(ctx, key)
+func (m *Manager) restartDesktopLocked(ctx context.Context, key string, workingDir string) (SessionInfo, error) {
+	sess, err := m.ensureDesktopStartedLocked(ctx, key, workingDir)
 	if err != nil {
 		return SessionInfo{}, err
+	}
+	if strings.TrimSpace(workingDir) != "" {
+		normalized := normalizePath(workingDir)
+		if err := sess.Desktop.SyncWorkingDirectory(ctx, normalized); err != nil {
+			return SessionInfo{}, err
+		}
+		sess.WorkingDir = normalized
 	}
 	if err := sess.Desktop.RestartJuliaREPL(ctx); err == nil {
 		return sessionInfoFromState(sess), nil
@@ -122,9 +157,16 @@ func (m *Manager) restartDesktopLocked(ctx context.Context, key string) (Session
 		m.logger.Printf("desktop restart failed, resetting session and retrying once")
 	}
 	m.resetLocked(key)
-	sess, err = m.ensureDesktopStartedLocked(ctx, key)
+	sess, err = m.ensureDesktopStartedLocked(ctx, key, workingDir)
 	if err != nil {
 		return SessionInfo{}, err
+	}
+	if strings.TrimSpace(workingDir) != "" {
+		normalized := normalizePath(workingDir)
+		if err := sess.Desktop.SyncWorkingDirectory(ctx, normalized); err != nil {
+			return SessionInfo{}, err
+		}
+		sess.WorkingDir = normalized
 	}
 	if err := sess.Desktop.RestartJuliaREPL(ctx); err != nil {
 		return SessionInfo{}, err
@@ -142,7 +184,7 @@ func (m *Manager) callDesktopWithSession(ctx context.Context, sess *bridgeSessio
 	return sess.Desktop.Call(ctx, method, sess.WorkingDir, payload)
 }
 
-func startDesktopSession(ctx context.Context, cfg config.Config, wd string, logger *log.Logger) (*desktopSession, error) {
+func launchDesktopSession(ctx context.Context, cfg config.Config, wd string, logger *log.Logger) (*desktopSession, error) {
 	envStatus := currentDesktopEnvStatus()
 	if err := validateDesktopEnvironment(runtime.GOOS, envStatus); err != nil {
 		return nil, err
@@ -185,17 +227,17 @@ func startDesktopSession(ctx context.Context, cfg config.Config, wd string, logg
 		}
 		return nil, fmt.Errorf("start syslab desktop: %w", err)
 	}
-	guardChildProcess(cmd, logger)
 	if diagLogger != nil && cmd.Process != nil {
 		diagLogger.Printf("process started: pid=%d", cmd.Process.Pid)
 	}
 
 	acceptCtx := ctx
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		acceptCtx, cancel = context.WithTimeout(ctx, 2*time.Minute)
-		defer cancel()
+	cancelAccept := func() {}
+	if derivedCtx, cancel := withOptionalTimeout(ctx, cfg.DesktopStartupTimeout); cancel != nil {
+		acceptCtx = derivedCtx
+		cancelAccept = cancel
 	}
+	defer cancelAccept()
 	if diagLogger != nil {
 		if deadline, ok := acceptCtx.Deadline(); ok {
 			diagLogger.Printf("waiting for desktop client connection: endpoint=%s deadline=%s", acceptor.Endpoint(), deadline.Format(time.RFC3339))
@@ -228,7 +270,7 @@ func startDesktopSession(ctx context.Context, cfg config.Config, wd string, logg
 		conn:       conn,
 		codec:      newDesktopJSONCodec(conn, func(format string, args ...any) { dsLog(diagLogger, format, args...) }),
 	}
-	if err := ds.waitReady(5 * time.Minute); err != nil {
+	if err := ds.waitReady(cfg.DesktopReadyTimeout); err != nil {
 		ds.logf("desktop ready handshake failed: %v", err)
 		_ = ds.Close()
 		return nil, err
@@ -239,6 +281,47 @@ func startDesktopSession(ctx context.Context, cfg config.Config, wd string, logg
 		return nil, err
 	}
 	ds.logf("desktop session ready")
+	return ds, nil
+}
+
+func attachDesktopSession(ctx context.Context, cfg config.Config, wd, endpoint string, logger *log.Logger) (*desktopSession, error) {
+	diagLogger, diagFile := newDesktopDiagLogger()
+	if diagLogger != nil {
+		diagLogger.Printf("desktop attach requested: endpoint=%s cwd=%s", endpoint, wd)
+	}
+
+	attachCtx := ctx
+	cancelAttach := func() {}
+	if derivedCtx, cancel := withOptionalTimeout(ctx, cfg.DesktopAttachTimeout); cancel != nil {
+		attachCtx = derivedCtx
+		cancelAttach = cancel
+	}
+	defer cancelAttach()
+
+	conn, err := connectDesktopEndpoint(attachCtx, endpoint)
+	if err != nil {
+		if diagFile != nil {
+			_ = diagFile.Close()
+		}
+		return nil, fmt.Errorf("connect existing syslab desktop endpoint %q: %w", endpoint, err)
+	}
+
+	ds := &desktopSession{
+		cfg:        cfg,
+		logger:     logger,
+		diagLogger: diagLogger,
+		diagFile:   diagFile,
+		workingDir: "",
+		cmd:        nil,
+		conn:       conn,
+	}
+	ds.codec = newDesktopJSONCodec(conn, func(format string, args ...any) { dsLog(diagLogger, format, args...) })
+	if err := ds.SyncWorkingDirectory(ctx, wd); err != nil {
+		ds.logf("desktop attach working directory sync failed: %v", err)
+		_ = ds.Close()
+		return nil, err
+	}
+	ds.logf("desktop session attached")
 	return ds, nil
 }
 
@@ -285,7 +368,7 @@ func (s *desktopSession) EnsureJuliaREPL(ctx context.Context) error {
 		return nil
 	}
 	s.logf("EnsureJuliaREPL: start")
-	_, err := s.sendCommand(ctx, desktopStartREPLCommand, "", 2*time.Minute)
+	_, err := s.sendCommand(ctx, desktopStartREPLCommand, "", s.cfg.DesktopREPLTimeout)
 	if err != nil {
 		s.logf("EnsureJuliaREPL: start failed: %v", err)
 		return err
@@ -298,13 +381,13 @@ func (s *desktopSession) EnsureJuliaREPL(ctx context.Context) error {
 func (s *desktopSession) RestartJuliaREPL(ctx context.Context) error {
 	s.logf("RestartJuliaREPL: begin")
 	if s.replStarted {
-		if _, err := s.sendCommand(ctx, desktopStopREPLCommand, "", 2*time.Minute); err != nil && s.logger != nil {
+		if _, err := s.sendCommand(ctx, desktopStopREPLCommand, "", s.cfg.DesktopREPLTimeout); err != nil && s.logger != nil {
 			s.logger.Printf("desktop stopREPL failed before restart: %v", err)
 			s.logf("RestartJuliaREPL: stop failed: %v", err)
 		}
 		s.replStarted = false
 	}
-	if _, err := s.sendCommand(ctx, desktopStartREPLCommand, "", 2*time.Minute); err != nil {
+	if _, err := s.sendCommand(ctx, desktopStartREPLCommand, "", s.cfg.DesktopREPLTimeout); err != nil {
 		s.logf("RestartJuliaREPL: start failed: %v", err)
 		return err
 	}
@@ -325,7 +408,7 @@ func (s *desktopSession) SyncWorkingDirectory(ctx context.Context, cwd string) e
 		return nil
 	}
 	s.logf("SyncWorkingDirectory: %s", abs)
-	if _, err := s.sendCommand(ctx, desktopOpenFolderCommand, abs, 30*time.Second); err != nil {
+	if _, err := s.sendCommand(ctx, desktopOpenFolderCommand, abs, s.cfg.DesktopControlTimeout); err != nil {
 		s.logf("SyncWorkingDirectory failed: %v", err)
 		return err
 	}
@@ -338,12 +421,12 @@ func (s *desktopSession) runJuliaFile(ctx context.Context, scriptPath string) (B
 	if err != nil {
 		return BridgeResult{}, err
 	}
-	if _, err := s.sendCommand(ctx, desktopOpenFileCommand, abs, 30*time.Second); err != nil {
+	if _, err := s.sendCommand(ctx, desktopOpenFileCommand, abs, s.cfg.DesktopControlTimeout); err != nil {
 		return BridgeResult{}, err
 	}
-	reply, err := s.sendCommand(ctx, desktopExecFileCommand, "", 10*time.Minute)
+	reply, err := s.sendCommand(ctx, desktopExecFileCommand, "", 0)
 	if err != nil {
-		reply, err = s.sendCommand(ctx, desktopExecFileCommand2, "", 10*time.Minute)
+		reply, err = s.sendCommand(ctx, desktopExecFileCommand2, "", 0)
 		if err != nil {
 			return BridgeResult{}, err
 		}
@@ -352,7 +435,7 @@ func (s *desktopSession) runJuliaFile(ctx context.Context, scriptPath string) (B
 }
 
 func (s *desktopSession) callJuliaREPL(ctx context.Context, cwd, payload string) (BridgeResult, error) {
-	reply, err := s.sendCommand(ctx, desktopEvalCommand, payload, 10*time.Minute)
+	reply, err := s.sendCommand(ctx, desktopEvalCommand, payload, 0)
 	if err != nil {
 		return BridgeResult{}, err
 	}
@@ -360,7 +443,7 @@ func (s *desktopSession) callJuliaREPL(ctx context.Context, cwd, payload string)
 }
 
 func (s *desktopSession) withTerminalOutput(ctx context.Context, result BridgeResult) BridgeResult {
-	reply, err := s.sendCommand(ctx, desktopTerminalDataCommand, "", 30*time.Second)
+	reply, err := s.sendCommand(ctx, desktopTerminalDataCommand, "", s.cfg.DesktopControlTimeout)
 	if err != nil {
 		s.logf("get terminal output failed: %v", err)
 		return result
@@ -391,16 +474,23 @@ func (s *desktopSession) sendCommand(ctx context.Context, command, args string, 
 }
 
 func (s *desktopSession) waitForCommand(ctx context.Context, command string, timeout time.Duration) (desktopMessage, error) {
-	deadline := time.Now().Add(timeout)
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return desktopMessage{}, err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return desktopMessage{}, fmt.Errorf("timeout waiting for desktop reply: %s", command)
+		recvTimeout := 200 * time.Millisecond
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return desktopMessage{}, fmt.Errorf("timeout waiting for desktop reply: %s", command)
+			}
+			recvTimeout = minDuration(remaining, recvTimeout)
 		}
-		msg, err := s.codec.Recv(minDuration(remaining, 200*time.Millisecond))
+		msg, err := s.codec.Recv(recvTimeout)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "timeout") {
 				continue
@@ -413,6 +503,16 @@ func (s *desktopSession) waitForCommand(ctx context.Context, command string, tim
 			return msg, nil
 		}
 	}
+}
+
+func withOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, nil
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, nil
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (s *desktopSession) detectEnvironmentText(cwd string) string {
@@ -444,6 +544,20 @@ func (s *desktopSession) Close() error {
 	}
 	if s.cmd != nil {
 		_ = terminateProcess(s.cmd)
+	}
+	if s.diagFile != nil {
+		_ = s.diagFile.Close()
+	}
+	return nil
+}
+
+func (s *desktopSession) Detach() error {
+	s.logf("desktop session detach")
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		releaseProcessLifetime(s.cmd.Process.Pid)
 	}
 	if s.diagFile != nil {
 		_ = s.diagFile.Close()

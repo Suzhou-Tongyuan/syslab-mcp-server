@@ -13,7 +13,6 @@
   - `evaluate_julia_code`
   - `run_julia_file`
   - `restart_julia`
-  - `list_sessions`
   - `read_syslab_skill`
   - `search_syslab_docs`
   - `read_syslab_doc`

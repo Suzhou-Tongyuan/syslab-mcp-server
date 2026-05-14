@@ -132,12 +132,6 @@ def main() -> int:
             "jsonrpc": "2.0",
             "id": 6,
             "method": "tools/call",
-            "params": {"name": "list_sessions", "arguments": {}},
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
             "params": {
                 "name": "restart_julia",
                 "arguments": {},
@@ -145,7 +139,7 @@ def main() -> int:
         },
         {
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 7,
             "method": "tools/call",
             "params": {
                 "name": "search_syslab_docs",
@@ -163,7 +157,6 @@ def main() -> int:
         "evaluate_julia_code",
         "run_julia_file",
         "restart_julia",
-        "list_sessions",
         "read_syslab_skill",
         "search_syslab_docs",
         "read_syslab_doc",
@@ -216,18 +209,14 @@ def main() -> int:
     assert_true("hello from sample script" in run_text, "run_julia_file output missing script stdout")
     assert_true("result:\n3" in run_text, "run_julia_file output missing final result")
 
-    list_payload = json.loads(get_tool_text(get_response_by_id(responses, 6)))
-    assert_true(list_payload["tool"] == "list_sessions", "unexpected list_sessions payload")
-    assert_true(len(list_payload["sessions"]) >= 1, "list_sessions returned no sessions")
-
-    restart_payload = json.loads(get_tool_text(get_response_by_id(responses, 7)))
+    restart_payload = json.loads(get_tool_text(get_response_by_id(responses, 6)))
     assert_true(restart_payload["tool"] == "restart_julia", "unexpected restart_julia payload")
     assert_true(
         restart_payload["session"]["status"] == "running",
         "restart_julia did not return a running session",
     )
 
-    search_payload = json.loads(get_tool_text(get_response_by_id(responses, 8)))
+    search_payload = json.loads(get_tool_text(get_response_by_id(responses, 7)))
     doc_path = ""
     if search_payload["matches"]:
         doc_path = search_payload["matches"][0]["path"]

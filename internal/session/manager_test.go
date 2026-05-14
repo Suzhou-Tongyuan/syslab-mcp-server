@@ -53,6 +53,18 @@ func TestResolveRequestContextDoesNotInjectInitialWorkingFolderIntoCalls(t *test
 	}
 }
 
+func TestWorkingDirForKeyUsesOverride(t *testing.T) {
+	root := testutil.TestDir(t)
+	override := filepath.Join(root, "override")
+	mgr := NewManager(config.Config{InitialWorkingFolder: root}, log.New(io.Discard, "", 0))
+
+	got := mgr.workingDirForKey("", override)
+
+	if got != override {
+		t.Fatalf("workingDirForKey override = %q, want %q", got, override)
+	}
+}
+
 func TestBuildBridgeCommandSetsPkgOfflineEnv(t *testing.T) {
 	cmd := buildBridgeCommand(context.Background(), "julia-ty.bat", "bridge.jl", "", true)
 	found := false
@@ -64,6 +76,58 @@ func TestBuildBridgeCommandSetsPkgOfflineEnv(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected JULIA_PKG_OFFLINE=true in env, got %+v", cmd.Env)
+	}
+}
+
+func TestEnsureBridgeRuntimeConfigLockedResolvesJuliaRootAndLauncherLazily(t *testing.T) {
+	root := testutil.TestDir(t)
+	juliaRoot := filepath.Join(root, "julia-1.10.10")
+	launcherName := "julia-ty.sh"
+	launcherBody := "#!/bin/sh\n"
+	if runtime.GOOS == "windows" {
+		launcherName = "julia-ty.bat"
+		launcherBody = "@echo off\r\n"
+	}
+	launcherPath := filepath.Join(juliaRoot, "bin", launcherName)
+	if err := os.MkdirAll(filepath.Dir(launcherPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launcherPath, []byte(launcherBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	syslabEnvDir := filepath.Join(root, ".syslab")
+	if err := os.MkdirAll(syslabEnvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(syslabEnvDir, "syslab-env.ini")
+	content := "[Syslab]\nJULIA_HOME=" + filepath.ToSlash(juliaRoot) + "\n"
+	if err := os.WriteFile(envPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	oldUserProfile := os.Getenv("USERPROFILE")
+	if err := os.Setenv("HOME", root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("USERPROFILE", root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv("HOME", oldHome)
+		_ = os.Setenv("USERPROFILE", oldUserProfile)
+	})
+
+	mgr := NewManager(config.Config{SyslabRoot: root}, log.New(io.Discard, "", 0))
+	if err := mgr.ensureBridgeRuntimeConfigLocked(); err != nil {
+		t.Fatalf("ensureBridgeRuntimeConfigLocked() error = %v", err)
+	}
+	if mgr.cfg.JuliaRoot != juliaRoot {
+		t.Fatalf("expected JuliaRoot %q, got %q", juliaRoot, mgr.cfg.JuliaRoot)
+	}
+	if mgr.cfg.SyslabLauncher != launcherPath {
+		t.Fatalf("expected SyslabLauncher %q, got %q", launcherPath, mgr.cfg.SyslabLauncher)
 	}
 }
 
@@ -150,6 +214,25 @@ func TestBuildDesktopCommandDetachesFromRequestContextAndStdin(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected %s in env, got %+v", desktopPipeEnvVar, cmd.Env)
+	}
+}
+
+func TestEnsureDesktopStartedLockedReusesAttachedSessionWithoutCmd(t *testing.T) {
+	mgr := NewManager(config.Config{SyslabDisplayMode: "desktop"}, log.New(io.Discard, "", 0))
+	existing := &bridgeSession{
+		Key:        "",
+		WorkingDir: "D:\\attached",
+		StartedAt:  time.Now().Format(time.RFC3339),
+		Desktop:    &desktopSession{},
+	}
+	mgr.sessions[""] = existing
+
+	got, err := mgr.ensureDesktopStartedLocked(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("ensureDesktopStartedLocked() error = %v", err)
+	}
+	if got != existing {
+		t.Fatal("expected attached desktop session to be reused")
 	}
 }
 

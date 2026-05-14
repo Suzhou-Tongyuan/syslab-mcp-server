@@ -12,11 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syslab-mcp/internal/config"
+	"syslab-mcp/internal/discovery"
 	"time"
 )
 
@@ -69,14 +69,20 @@ func (m *Manager) LauncherPath() string {
 	return m.cfg.SyslabLauncher
 }
 
+func (m *Manager) EnsureRuntimeConfig() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureBridgeRuntimeConfigLocked()
+}
+
 func (m *Manager) EnsureStarted(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.usesDesktopMode() {
-		_, err := m.ensureDesktopStartedLocked(ctx, "")
+		_, err := m.ensureDesktopStartedLocked(ctx, "", "")
 		return err
 	}
-	_, err := m.ensureStartedLocked(ctx, "")
+	_, err := m.ensureStartedLocked(ctx, "", "")
 	return err
 }
 
@@ -88,7 +94,7 @@ func (m *Manager) Call(ctx context.Context, method, envPath, cwd, payload string
 	if m.usesDesktopMode() {
 		return m.callDesktopLocked(ctx, key, method, normalizedCWD, payload)
 	}
-	sess, err := m.ensureStartedLocked(ctx, key)
+	sess, err := m.ensureStartedLocked(ctx, key, "")
 	if err != nil {
 		return BridgeResult{}, err
 	}
@@ -113,34 +119,20 @@ func (m *Manager) Call(ctx context.Context, method, envPath, cwd, payload string
 	return m.readResponseLocked(ctx, sess, "bridge call "+method)
 }
 
-func (m *Manager) Restart(ctx context.Context) (SessionInfo, error) {
+func (m *Manager) Restart(ctx context.Context, workingDir string) (SessionInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	key := ""
 	if m.usesDesktopMode() {
-		return m.restartDesktopLocked(ctx, key)
+		return m.restartDesktopLocked(ctx, key, workingDir)
 	}
 	m.resetLocked(key)
-	sess, err := m.ensureStartedLocked(ctx, key)
+	sess, err := m.ensureStartedLocked(ctx, key, workingDir)
 	if err != nil {
 		return SessionInfo{}, err
 	}
 	return sessionInfoFromState(sess), nil
-}
-
-func (m *Manager) List() []SessionInfo {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	list := make([]SessionInfo, 0, len(m.sessions))
-	for _, sess := range m.sessions {
-		list = append(list, sessionInfoFromState(sess))
-	}
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].Key < list[j].Key
-	})
-	return list
 }
 
 func (m *Manager) CloseAll() {
@@ -152,6 +144,15 @@ func (m *Manager) CloseAll() {
 		keys = append(keys, key)
 	}
 	for _, key := range keys {
+		sess, ok := m.sessions[key]
+		if !ok {
+			continue
+		}
+		if sess.Desktop != nil {
+			_ = sess.Desktop.Detach()
+			delete(m.sessions, key)
+			continue
+		}
 		m.resetLocked(key)
 	}
 }
@@ -210,9 +211,13 @@ func (m *Manager) readResponseLocked(ctx context.Context, sess *bridgeSession, o
 	}
 }
 
-func (m *Manager) ensureStartedLocked(ctx context.Context, key string) (*bridgeSession, error) {
+func (m *Manager) ensureStartedLocked(ctx context.Context, key string, workingDirOverride string) (*bridgeSession, error) {
 	if sess, ok := m.sessions[key]; ok && sess.Cmd != nil {
 		return sess, nil
+	}
+
+	if err := m.ensureBridgeRuntimeConfigLocked(); err != nil {
+		return nil, err
 	}
 
 	if _, err := os.Stat(m.cfg.SyslabLauncher); err != nil {
@@ -223,7 +228,7 @@ func (m *Manager) ensureStartedLocked(ctx context.Context, key string) (*bridgeS
 	}
 
 	cmd := buildBridgeCommand(ctx, m.cfg.SyslabLauncher, m.cfg.BridgeScript, key, m.cfg.PkgOffline)
-	workingDir := m.workingDirForKey(key)
+	workingDir := m.workingDirForKey(key, workingDirOverride)
 	cmd.Dir = workingDir
 
 	stdin, err := cmd.StdinPipe()
@@ -268,6 +273,20 @@ func (m *Manager) ensureStartedLocked(ctx context.Context, key string) (*bridgeS
 	return sess, nil
 }
 
+func (m *Manager) ensureBridgeRuntimeConfigLocked() error {
+	juliaRoot, err := discovery.ResolveJuliaRoot(m.cfg.JuliaRoot, m.cfg.SyslabRoot)
+	if err != nil {
+		return err
+	}
+	launcher, err := discovery.ResolveSyslabLauncher(m.cfg.SyslabLauncher, juliaRoot)
+	if err != nil {
+		return err
+	}
+	m.cfg.JuliaRoot = juliaRoot
+	m.cfg.SyslabLauncher = launcher
+	return nil
+}
+
 func (m *Manager) writeRequestLocked(sess *bridgeSession, id, method, cwd, payload string) error {
 	line := strings.Join([]string{
 		requestPrefix,
@@ -287,7 +306,7 @@ func (m *Manager) resetLocked(key string) {
 		return
 	}
 	if sess.Desktop != nil {
-		_ = sess.Desktop.Close()
+		_ = sess.Desktop.Detach()
 		delete(m.sessions, key)
 		return
 	}
@@ -345,7 +364,10 @@ func (m *Manager) normalizeWorkingDir(cwd string) string {
 	return normalizePath(cwd)
 }
 
-func (m *Manager) workingDirForKey(key string) string {
+func (m *Manager) workingDirForKey(key string, workingDirOverride string) string {
+	if strings.TrimSpace(workingDirOverride) != "" {
+		return normalizePath(workingDirOverride)
+	}
 	if key == "" {
 		return m.cfg.InitialWorkingFolder
 	}

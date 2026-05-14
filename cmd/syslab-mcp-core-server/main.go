@@ -18,9 +18,9 @@ import (
 	"syslab-mcp/internal/mcpserver"
 	"syslab-mcp/internal/session"
 	"syslab-mcp/internal/skills"
-	"syslab-mcp/internal/syslabenv"
 	"syslab-mcp/internal/tydocs"
 	"syslab-mcp/pkg/tools"
+	"time"
 )
 
 var version = "0.1.0"
@@ -146,6 +146,11 @@ func parseFlags() config.Config {
 	flag.BoolVar(&cfg.PkgOffline, "pkg-offline", true, "Start Julia with package offline mode enabled by default")
 	flag.StringVar(&cfg.InitialWorkingFolder, "initial-working-folder", "", "Initial working directory used when starting Syslab sessions")
 	flag.StringVar(&cfg.SyslabDisplayMode, "syslab-display-mode", "desktop", "Execution mode. Current implementation treats nodesktop as Julia-only mode")
+	flag.DurationVar(&cfg.DesktopStartupTimeout, "desktop-startup-timeout", 2*time.Minute, "Desktop launch timeout before the Syslab client connects back")
+	flag.DurationVar(&cfg.DesktopReadyTimeout, "desktop-ready-timeout", 5*time.Minute, "Desktop ready handshake timeout after the Syslab client connects")
+	flag.DurationVar(&cfg.DesktopAttachTimeout, "desktop-attach-timeout", 15*time.Second, "Timeout for attaching to an existing desktop IPC endpoint")
+	flag.DurationVar(&cfg.DesktopREPLTimeout, "desktop-repl-timeout", 2*time.Minute, "Timeout for desktop Julia REPL start/stop operations")
+	flag.DurationVar(&cfg.DesktopControlTimeout, "desktop-control-timeout", 30*time.Second, "Timeout for desktop control operations such as openFolder/openFile/getAllTerminalData")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Logging level")
 	flag.BoolVar(&cfg.DisableTelemetry, "disable-telemetry", true, "Reserved compatibility flag")
 	flag.Parse()
@@ -187,23 +192,36 @@ func parseFlags() config.Config {
 	}
 	cfg.SkillFile = skillFile
 
-	hasDefaultSyslabEnv, err := syslabenv.DefaultExists()
-	if err != nil {
-		panic(err)
-	}
-	cfg.SyslabDisplayMode = normalizeSyslabDisplayMode(cfg.SyslabDisplayMode, hasDefaultSyslabEnv)
+	cfg.SyslabDisplayMode = normalizeSyslabDisplayMode(cfg.SyslabDisplayMode)
 
-	juliaRoot, err := discovery.ResolveJuliaRoot(cfg.JuliaRoot, cfg.SyslabRoot)
-	if err != nil {
-		panic(err)
-	}
-	cfg.JuliaRoot = juliaRoot
+	if !strings.EqualFold(cfg.SyslabDisplayMode, "desktop") {
+		juliaRoot, err := discovery.ResolveJuliaRoot(cfg.JuliaRoot, cfg.SyslabRoot)
+		if err != nil {
+			panic(err)
+		}
+		cfg.JuliaRoot = juliaRoot
 
-	launcher, err := discovery.ResolveSyslabLauncher(cfg.SyslabLauncher, cfg.JuliaRoot)
-	if err != nil {
-		panic(err)
+		launcher, err := discovery.ResolveSyslabLauncher(cfg.SyslabLauncher, cfg.JuliaRoot)
+		if err != nil {
+			panic(err)
+		}
+		cfg.SyslabLauncher = launcher
+	} else {
+		if strings.TrimSpace(cfg.JuliaRoot) != "" {
+			juliaRoot, err := discovery.ResolveJuliaRoot(cfg.JuliaRoot, cfg.SyslabRoot)
+			if err != nil {
+				panic(err)
+			}
+			cfg.JuliaRoot = juliaRoot
+		}
+		if strings.TrimSpace(cfg.SyslabLauncher) != "" {
+			launcher, err := discovery.ResolveSyslabLauncher(cfg.SyslabLauncher, cfg.JuliaRoot)
+			if err != nil {
+				panic(err)
+			}
+			cfg.SyslabLauncher = launcher
+		}
 	}
-	cfg.SyslabLauncher = launcher
 
 	if strings.TrimSpace(cfg.HelpDocsRoot) != "" && !filepath.IsAbs(cfg.HelpDocsRoot) {
 		abs, err := filepath.Abs(cfg.HelpDocsRoot)
@@ -216,13 +234,10 @@ func parseFlags() config.Config {
 	return cfg
 }
 
-func normalizeSyslabDisplayMode(mode string, hasDefaultSyslabEnv bool) string {
+func normalizeSyslabDisplayMode(mode string) string {
 	normalized := strings.TrimSpace(mode)
 	if normalized == "" {
 		normalized = "desktop"
-	}
-	if !hasDefaultSyslabEnv {
-		return "nodesktop"
 	}
 	return normalized
 }

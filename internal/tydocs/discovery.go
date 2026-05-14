@@ -39,7 +39,7 @@ type buildInfo struct {
 	Version string `json:"version"`
 }
 
-func DiscoverInstalledPackages(syslabRoot string, launcherPath string) (EnvironmentInfo, error) {
+func DiscoverInstalledPackages(syslabRoot string, launcherPath string, includeAllPackages bool) (EnvironmentInfo, error) {
 	launcherEnv, err := syslabenv.LoadFromLauncher(launcherPath)
 	if err != nil {
 		return EnvironmentInfo{}, err
@@ -53,7 +53,7 @@ func DiscoverInstalledPackages(syslabRoot string, launcherPath string) (Environm
 	if err != nil {
 		return EnvironmentInfo{}, err
 	}
-	manifestFile, activeProject, manifestJuliaVersion, packages, err := detectPackagesFromGlobalManifest(env)
+	manifestFile, activeProject, manifestJuliaVersion, packages, err := detectPackagesFromGlobalManifest(env, includeAllPackages)
 	if err != nil {
 		return EnvironmentInfo{}, err
 	}
@@ -88,7 +88,7 @@ func detectSyslabVersion(syslabRoot string) (string, string, error) {
 	return version, buildInfoPath, nil
 }
 
-func detectPackagesFromGlobalManifest(env syslabenv.Env) (manifestFile string, activeProject string, manifestJuliaVersion string, packages []PackageInfo, err error) {
+func detectPackagesFromGlobalManifest(env syslabenv.Env, includeAllPackages bool) (manifestFile string, activeProject string, manifestJuliaVersion string, packages []PackageInfo, err error) {
 	depotPath := strings.TrimSpace(env.Values["JULIA_DEPOT_PATH"])
 	if depotPath == "" {
 		fallbackDepot, ok, err := syslabenv.EnvDepotPathIfExists()
@@ -145,7 +145,7 @@ func detectPackagesFromGlobalManifest(env syslabenv.Env) (manifestFile string, a
 				continue
 			}
 			if matches := manifestSectionPattern.FindStringSubmatch(line); len(matches) == 2 {
-				if current != nil && current.Name != "" && IsTargetPackage(current.Name) {
+				if current != nil && current.Name != "" && shouldIncludePackage(current.Name, includeAllPackages) {
 					candidatePackages = append(candidatePackages, *current)
 				}
 				current = &PackageInfo{Name: strings.TrimSpace(matches[1])}
@@ -167,7 +167,7 @@ func detectPackagesFromGlobalManifest(env syslabenv.Env) (manifestFile string, a
 			lastErr = fmt.Errorf("scan manifest file: %w", err)
 			continue
 		}
-		if current != nil && current.Name != "" && IsTargetPackage(current.Name) {
+		if current != nil && current.Name != "" && shouldIncludePackage(current.Name, includeAllPackages) {
 			candidatePackages = append(candidatePackages, *current)
 		}
 		manifestJuliaVersion = candidateJuliaVersion
@@ -187,7 +187,14 @@ func splitDepotPaths(paths string) []string {
 }
 
 func IsTargetPackage(name string) bool {
-	return strings.HasPrefix(name, "Ty") || name == "Syslab"
+	return strings.HasPrefix(name, "Ty")
+}
+
+func shouldIncludePackage(name string, includeAllPackages bool) bool {
+	if includeAllPackages {
+		return true
+	}
+	return IsTargetPackage(name)
 }
 
 func detectJuliaEnvVersion(env syslabenv.Env) string {

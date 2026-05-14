@@ -76,12 +76,18 @@ func NewCatalog(sess *session.Manager, docs *tydocs.Catalog, skillFile string, e
 	c.add(Tool{
 		Name:        "detect_syslab_toolboxes",
 		Description: "Returns Syslab version information from <syslab-root>/versionInfo, Julia depot information from julia-ty, installed Julia packages in the Syslab Julia environment including Ty packages, and discovered local docs paths for those packages. Call read_syslab_skill first to load the active Syslab skill, then call this tool before planning, writing, or executing Julia code so you can prefer Ty libraries and already-installed Julia packages in the current environment.",
-		InputSchema: objectSchema(nil, nil),
+		InputSchema: objectSchema(map[string]any{
+			"include_all_packages": map[string]any{"type": "boolean"},
+		}, nil),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			if err := c.policy.requireSkillInspection("detect_syslab_toolboxes"); err != nil {
 				return "", err
 			}
-			result, err := detectSyslabToolboxes(ctx, sess, docs)
+			includeAllPackages, err := optionalBool(args, "include_all_packages")
+			if err != nil {
+				return "", err
+			}
+			result, err := detectSyslabToolboxes(ctx, sess, docs, includeAllPackages)
 			if err == nil {
 				c.policy.markEnvironmentInspected()
 			}
@@ -141,9 +147,15 @@ func NewCatalog(sess *session.Manager, docs *tydocs.Catalog, skillFile string, e
 	c.add(Tool{
 		Name:        "restart_julia",
 		Description: "Restarts the global Julia session.",
-		InputSchema: objectSchema(nil, nil),
+		InputSchema: objectSchema(map[string]any{
+			"working_directory": map[string]any{"type": "string"},
+		}, nil),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			info, err := sess.Restart(ctx)
+			workingDir, err := optionalString(args, "working_directory")
+			if err != nil {
+				return "", err
+			}
+			info, err := sess.Restart(ctx, workingDir)
 			if err != nil {
 				return "", err
 			}
@@ -159,34 +171,20 @@ func NewCatalog(sess *session.Manager, docs *tydocs.Catalog, skillFile string, e
 	})
 
 	c.add(Tool{
-		Name:        "list_sessions",
-		Description: "Lists all active sessions and their status.",
-		InputSchema: objectSchema(nil, nil),
-		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			data, err := json.MarshalIndent(map[string]any{
-				"tool":     "list_sessions",
-				"sessions": sess.List(),
-			}, "", "  ")
-			if err != nil {
-				return "", err
-			}
-			return string(data), nil
-		},
-	})
-
-	c.add(Tool{
 		Name:        "read_syslab_skill",
-		Description: "Reads the Syslab skill markdown file. When skill_path is omitted, it uses the same skill.md path resolved during server startup and initialize.",
+		Description: "Reads the Syslab skill markdown file. Pass skill_path=\"default\" to read the default skill file, or pass an absolute skill markdown path to read a specific file.",
 		InputSchema: objectSchema(map[string]any{
 			"skill_path": map[string]any{"type": "string"},
-		}, nil),
+		}, []string{"skill_path"}),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			requestedPath, err := optionalString(args, "skill_path")
 			if err != nil {
 				return "", err
 			}
 			resolvedSkillPath := skillFile
-			if strings.TrimSpace(requestedPath) != "" {
+			if strings.EqualFold(strings.TrimSpace(requestedPath), "default") {
+				resolvedSkillPath = skillFile
+			} else if strings.TrimSpace(requestedPath) != "" {
 				resolvedSkillPath = requestedPath
 			}
 
@@ -355,8 +353,14 @@ func (c *Catalog) Call(ctx context.Context, name string, args map[string]any) (s
 	return tool.Handler(ctx, args)
 }
 
-func detectSyslabToolboxes(ctx context.Context, sess *session.Manager, docs *tydocs.Catalog) (string, error) {
-	envInfo, err := tydocs.DiscoverInstalledPackages(docsRoot(docs, sess), launcherPath(docs, sess))
+func detectSyslabToolboxes(ctx context.Context, sess *session.Manager, docs *tydocs.Catalog, includeAllPackages bool) (string, error) {
+	if sess != nil {
+		if err := sess.EnsureRuntimeConfig(); err != nil {
+			return "", err
+		}
+	}
+
+	envInfo, err := tydocs.DiscoverInstalledPackages(docsRoot(docs, sess), launcherPath(docs, sess), includeAllPackages)
 	if err != nil {
 		return "", err
 	}
@@ -511,6 +515,18 @@ func optionalString(args map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("argument %s must be a string", key)
 	}
 	return s, nil
+}
+
+func optionalBool(args map[string]any, key string) (bool, error) {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return false, nil
+	}
+	b, ok := value.(bool)
+	if !ok {
+		return false, fmt.Errorf("argument %s must be a boolean", key)
+	}
+	return b, nil
 }
 
 func normalizeJLFile(path string) (string, error) {
